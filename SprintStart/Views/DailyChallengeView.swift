@@ -30,6 +30,7 @@ struct DailyChallengeView: View {
 #endif
 
     private let synthesizer = AVSpeechSynthesizer()
+    @State private var audioPlayer: AVAudioPlayer?
     private let markHapticGenerator = UIImpactFeedbackGenerator(style: .light)
     private let setHapticGenerator = UIImpactFeedbackGenerator(style: .medium)
     private let startHapticGenerator = UINotificationFeedbackGenerator()
@@ -52,7 +53,7 @@ struct DailyChallengeView: View {
                 challengeHeroSection
                 challengeStatusSection
                 challengeZoneSection
-                eventHubSection
+                inlineLeaderboardSection
 #if DEBUG
                 debugSection
 #endif
@@ -60,10 +61,28 @@ struct DailyChallengeView: View {
             }
             .padding(GlassLayout.screenPadding)
         }
+        .refreshable {
+            await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
+        }
         .scrollDisabled(isHolding || sequenceActive)
         .navigationTitle("Daily Challenge")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar{
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                NavigationLink {
+                    DailyEventHubPage()
+                        .environmentObject(appStore)
+                        .environmentObject(gameCenterManager)
+                        .environmentObject(dailyChallengeStore)
+                } label: {
+                    Image(systemName: "list.number")
+                        .imageScale(.large)
+                        .foregroundStyle(themeColor)
+                        .accessibilityLabel("Leaderboard & Badges")
+                }
+                .disabled(isHolding || sequenceActive)
+                .opacity((isHolding || sequenceActive) ? 0.45 : 1.0)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink(destination: SettingsView()) {
                     Image(systemName: "gear")
@@ -175,13 +194,6 @@ struct DailyChallengeView: View {
 
     private var challengeZoneSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            AppSectionHeader(
-                systemName: "bolt.badge.clock",
-                tint: themeColor,
-                title: "Challenge Run",
-                summary: "False starts burn attempts. Best time submits when you finish."
-            )
-
             ZStack {
                 Color.clear
                     .liquidGlassCard()
@@ -189,7 +201,8 @@ struct DailyChallengeView: View {
                     .overlay(challengeZoneContent)
                     .overlay(challengeZoneTouchOverlay)
             }
-            .frame(height: 320)
+            .frame(height: dailyChallengeStore.hasSubmittedToday ? 160 : 320)
+            .animation(.spring(response: 0.45, dampingFraction: 0.82), value: dailyChallengeStore.hasSubmittedToday)
             .contentShape(Rectangle())
 
             if dailyChallengeStore.canDiscardAndSubmit {
@@ -236,16 +249,26 @@ struct DailyChallengeView: View {
                     subtitle: "Required for leaderboard entries."
                 )
             } else if dailyChallengeStore.hasSubmittedToday {
-                VStack(spacing: 8) {
-                    Text("Score Locked In")
+                VStack(spacing: 6) {
+                    Text("You're In")
                         .font(AppTypography.captionEmphasis)
                         .foregroundStyle(.secondary)
                     Text(dailyChallengeStore.bestReactionMS.map { "\($0) ms" } ?? "--")
                         .font(AppTypography.metric)
                         .foregroundStyle(themeColor)
-                    Text("Next challenge after midnight EST.")
+                    if let rank = playerLeaderboardEntry?.rank {
+                        Text("Ranked #\(rank) today")
+                            .font(AppTypography.bodyStrong)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Awaiting ranking…")
+                            .font(AppTypography.body)
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text("Resets at midnight EST.")
                         .font(AppTypography.caption)
                         .foregroundStyle(.tertiary)
+                        .padding(.top, 2)
                 }
             } else if let ms = reactionMS {
                 Text("\(ms) ms")
@@ -318,12 +341,49 @@ struct DailyChallengeView: View {
             .allowsHitTesting(false)
     }
 
-    private var eventHubSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("EVENT HUB")
-                .font(AppTypography.captionEmphasis)
-                .foregroundStyle(.secondary)
-                .padding(.leading, 4)
+    private var inlineLeaderboardSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("TOP TODAY")
+                    .font(AppTypography.captionEmphasis)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !dailyChallengeStore.leaderboard.isEmpty {
+                    let count = dailyChallengeStore.leaderboard.count
+                    Text("\(count) runner\(count == 1 ? "" : "s")")
+                        .font(AppTypography.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 4)
+            .padding(.bottom, 14)
+
+            if dailyChallengeStore.leaderboard.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "flag.2.crossed")
+                        .foregroundStyle(.tertiary)
+                    Text("No scores yet — be first.")
+                        .font(AppTypography.secondary)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 4)
+            } else {
+                let top3 = Array(dailyChallengeStore.leaderboard.prefix(3))
+                VStack(spacing: 0) {
+                    ForEach(Array(top3.enumerated()), id: \.element.id) { idx, entry in
+                        topTodayRow(entry)
+                        if idx < top3.count - 1 {
+                            Divider().padding(.horizontal, 2)
+                        }
+                    }
+                }
+
+                if let yourEntry = playerLeaderboardEntry, yourEntry.rank > 3 {
+                    Divider().padding(.vertical, 2)
+                    topTodayRow(yourEntry)
+                }
+            }
 
             NavigationLink {
                 DailyChallengeLeaderboardPage()
@@ -331,42 +391,45 @@ struct DailyChallengeView: View {
                     .environmentObject(gameCenterManager)
                     .environmentObject(dailyChallengeStore)
             } label: {
-                eventHubCard(
-                    title: "Leaderboard",
-                    subtitle: leaderboardPreviewSubtitle,
-                    value: leaderboardPreviewValue,
-                    systemName: "list.number",
-                    accent: leaderboardAccentColor,
-                    footnote: leaderboardPreviewFootnote
-                )
+                Text("See Full Leaderboard")
+                    .font(AppTypography.captionEmphasis)
+                    .foregroundStyle(themeColor)
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.plain)
-
-            NavigationLink {
-                DailyChallengeBadgesPage()
-                    .environmentObject(appStore)
-                    .environmentObject(gameCenterManager)
-                    .environmentObject(dailyChallengeStore)
-            } label: {
-                eventHubCard(
-                    title: "Badges",
-                    subtitle: badgesPreviewSubtitle,
-                    value: badgesPreviewValue,
-                    systemName: "rosette",
-                    accent: badgesAccentColor,
-                    footnote: badgesPreviewFootnote
-                )
-            }
-            .buttonStyle(.plain)
+            .padding(.top, 14)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .liquidGlassCard()
     }
+
+
 
 #if DEBUG
     private var debugSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             DisclosureGroup(isExpanded: $debugControlsExpanded) {
                 VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Variant")
+                            .font(AppTypography.secondaryStrong)
+                        Spacer()
+                        Picker("Variant", selection: Binding(
+                            get: { dailyChallengeStore.currentChallenge?.variant ?? .longBurn },
+                            set: { variant in
+                                dailyChallengeStore.debugForceVariant(variant)
+                                resetAttemptUI()
+                                isHolding = false
+                            }
+                        )) {
+                            ForEach(DailyChallengeVariant.allCases) { variant in
+                                Text(variant.title).tag(variant)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .tint(themeColor)
+                    }
+                    .padding(.horizontal, 4)
+
                     HStack(spacing: 10) {
                         Button(gameCenterManager.isAuthenticated ? "Mock Sign Out" : "Mock Sign In") {
                             if gameCenterManager.isAuthenticated {
@@ -500,105 +563,59 @@ struct DailyChallengeView: View {
         .padding(24)
     }
 
-    private var leaderboardPreviewValue: String {
-        if let first = dailyChallengeStore.leaderboard.first {
-            return "\(first.bestReactionMS) ms"
-        }
-        return "--"
-    }
-
-    private var leaderboardPreviewSubtitle: String {
-        if let yourEntry = playerLeaderboardEntry {
-            return "You're #\(yourEntry.rank) today."
-        }
-        if let first = dailyChallengeStore.leaderboard.first {
-            return "\(first.playerName) leads."
-        }
-        return "No scores yet."
-    }
-
-    private var leaderboardPreviewFootnote: String {
-        if let first = dailyChallengeStore.leaderboard.first {
-            return "Leader • \(first.playerName)"
-        }
-        return "Top 3 earns the podium"
-    }
-
-    private var badgesPreviewValue: String {
-        "\(dailyChallengeStore.badges.count)"
-    }
-
-    private var badgesPreviewSubtitle: String {
-        guard gameCenterManager.isAuthenticated else {
-            return "Connect Game Center to collect."
-        }
-        if let latest = dailyChallengeStore.badges.first {
-            return "Latest: \(latest.badge.title.lowercased()) from \(latest.challengeTitle)."
-        }
-        return "No badges earned yet."
-    }
-
-    private var badgesPreviewFootnote: String {
-        guard gameCenterManager.isAuthenticated else {
-            return "Permanent vault"
-        }
-        return dailyChallengeStore.badges.isEmpty ? "Place top 3 to earn" : "Permanent vault"
-    }
-
     private var playerLeaderboardEntry: DailyChallengeLeaderboardEntry? {
         guard let playerID = gameCenterManager.playerProfile?.gamePlayerID else { return nil }
         return dailyChallengeStore.leaderboard.first { $0.playerID == playerID }
     }
 
-    private var leaderboardAccentColor: Color {
-        playerLeaderboardEntry?.badge.map(badgeColor(for:)) ?? themeColor
-    }
+    private func topTodayRow(_ entry: DailyChallengeLeaderboardEntry) -> some View {
+        let isSelf = entry.playerID == gameCenterManager.playerProfile?.gamePlayerID
+        let rankTint: Color
+        switch entry.rank {
+        case 1: rankTint = .yellow
+        case 2: rankTint = Color(white: 0.62)
+        case 3: rankTint = .orange
+        default: rankTint = isSelf ? themeColor : .secondary
+        }
 
-    private var badgesAccentColor: Color {
-        dailyChallengeStore.badges.first.map { badgeColor(for: $0.badge) } ?? themeColor
-    }
-
-    private func eventHubCard(
-        title: String,
-        subtitle: String,
-        value: String,
-        systemName: String,
-        accent: Color,
-        footnote: String
-    ) -> some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    AppIconTile(systemName: systemName, tint: accent, size: 38, cornerRadius: 14)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(title)
-                            .font(AppTypography.cardTitle)
-                        Text(footnote)
-                            .font(AppTypography.caption)
-                            .foregroundStyle(.secondary)
-                    }
+        return HStack(spacing: 12) {
+            HStack(spacing: 5) {
+                Text("\(entry.rank)")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(rankTint)
+                    .frame(width: 20, alignment: .center)
+                if entry.rank <= 3 {
+                    Image(systemName: entry.rank == 1 ? "crown.fill" : "medal.fill")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(rankTint)
                 }
+            }
+            .frame(width: 38, alignment: .leading)
 
-                Text(subtitle)
-                    .font(AppTypography.secondary)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            Text(entry.playerName)
+                .font(isSelf ? AppTypography.bodyStrong : AppTypography.body)
+                .foregroundStyle(isSelf ? themeColor : .primary)
+                .lineLimit(1)
+
+            if isSelf {
+                Text("You")
+                    .font(AppTypography.captionEmphasis)
+                    .foregroundStyle(themeColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(themeColor.opacity(0.14), in: Capsule())
             }
 
             Spacer(minLength: 8)
 
-            VStack(alignment: .trailing, spacing: 6) {
-                Text(value)
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(accent)
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.quaternary)
-            }
+            Text("\(entry.bestReactionMS) ms")
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(isSelf ? themeColor : .primary)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .liquidGlassCard()
+        .padding(.vertical, 10)
+        .padding(.horizontal, 2)
     }
 
     private func badgeColor(for badge: DailyChallengeBadge) -> Color {
@@ -749,17 +766,17 @@ struct DailyChallengeView: View {
             return
         }
 
-        let player = try? AVAudioPlayer(contentsOf: url)
-        player?.prepareToPlay()
-        player?.play()
+        audioPlayer = try? AVAudioPlayer(contentsOf: url)
+        audioPlayer?.prepareToPlay()
+        audioPlayer?.play()
     }
 
     private func soundFileName(for style: DailyChallengeStartStyle) -> String? {
         switch style {
         case .starterGun:
-            return "starter_gun_1"
+            return ["starter_gun_1", "starter_gun_2", "starter_gun_3", "starter_gun_4"].randomElement()
         case .whistle:
-            return "whistle_2"
+            return ["whistle_1", "whistle_2", "whistle_3", "whistle_4"].randomElement()
         case .electronic:
             return "electronic_starter_1"
         case .clap:
@@ -783,6 +800,50 @@ struct DailyChallengeView: View {
                 }
             }
         }
+    }
+}
+
+private struct DailyEventHubPage: View {
+    @EnvironmentObject private var appStore: AppSettingsStore
+    @EnvironmentObject private var gameCenterManager: GameCenterManager
+    @EnvironmentObject private var dailyChallengeStore: DailyChallengeStore
+
+    private enum Tab: String, CaseIterable, Identifiable {
+        case leaderboard = "Leaderboard"
+        case badges = "Badges"
+        var id: Self { self }
+    }
+
+    @State private var selectedTab: Tab = .leaderboard
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $selectedTab) {
+                ForEach(Tab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, GlassLayout.screenPadding)
+            .padding(.top, 6)
+            .padding(.bottom, 10)
+
+            if selectedTab == .leaderboard {
+                DailyChallengeLeaderboardPage()
+                    .environmentObject(appStore)
+                    .environmentObject(gameCenterManager)
+                    .environmentObject(dailyChallengeStore)
+                    .transition(.opacity.combined(with: .move(edge: .leading)))
+            } else {
+                DailyChallengeBadgesPage()
+                    .environmentObject(appStore)
+                    .environmentObject(gameCenterManager)
+                    .environmentObject(dailyChallengeStore)
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: selectedTab)
+        .liquidGlassScreenBackground(theme: appStore.settings.theme)
     }
 }
 
@@ -825,6 +886,9 @@ private struct DailyChallengeLeaderboardPage: View {
                 }
             }
             .padding(GlassLayout.screenPadding)
+        }
+        .refreshable {
+            await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
         }
         .navigationTitle("Leaderboard")
         .navigationBarTitleDisplayMode(.inline)
@@ -1154,6 +1218,9 @@ private struct DailyChallengeBadgesPage: View {
                 }
             }
             .padding(GlassLayout.screenPadding)
+        }
+        .refreshable {
+            await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
         }
         .navigationTitle("Badge Vault")
         .navigationBarTitleDisplayMode(.inline)

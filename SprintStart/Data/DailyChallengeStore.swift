@@ -241,6 +241,22 @@ final class DailyChallengeStore: ObservableObject {
         leaderboard = []
         badges = []
     }
+
+    func debugForceVariant(_ variant: DailyChallengeVariant) {
+        DailyChallengeSchedule.debugVariantOverride = variant
+        let dateKey = DailyChallengeSchedule.currentDateKey()
+        let challenge = DailyChallenge.fallback(for: dateKey)
+        currentChallenge = challenge
+        let fresh = DailyChallengeProgress(
+            challengeDateKey: dateKey,
+            attempts: [],
+            didSubmit: false,
+            submittedBestReactionMS: nil
+        )
+        progress = fresh
+        saveProgress(fresh)
+        lastErrorMessage = nil
+    }
 #endif
 }
 
