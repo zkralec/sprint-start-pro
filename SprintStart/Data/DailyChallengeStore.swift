@@ -23,6 +23,13 @@ final class DailyChallengeStore: ObservableObject {
 
     private enum Keys {
         static let progressPrefix = "dailyChallengeProgress"
+        static let lastKnownPlayerID = "dailyChallenge.lastKnownPlayerID"
+    }
+
+    /// The most recently seen Game Center player ID, persisted across cold launches so we can
+    /// match the leaderboard entry even before GK authentication resolves.
+    var lastKnownPlayerID: String? {
+        defaults.string(forKey: Keys.lastKnownPlayerID)
     }
 
     init(
@@ -50,6 +57,12 @@ final class DailyChallengeStore: ObservableObject {
         progress?.didSubmit ?? false
     }
 
+    /// The Game Center player ID saved at submission time — available after cold launch before GC auth resolves.
+    var submittedPlayerID: String? { progress?.submittedPlayerID }
+
+    /// The display name saved at submission time — used as a last-resort match if player IDs don't align.
+    var submittedPlayerName: String? { progress?.submittedPlayerName }
+
     var canDiscardAndSubmit: Bool {
         attemptsUsed > 0 && !hasSubmittedToday && remainingAttempts > 0
     }
@@ -58,14 +71,40 @@ final class DailyChallengeStore: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        // Persist the player ID as soon as we have it — survives cold launches and backfills
+        // entries submitted before submittedPlayerID was added to DailyChallengeProgress.
+        if let playerID = playerProfile?.gamePlayerID {
+            defaults.set(playerID, forKey: Keys.lastKnownPlayerID)
+        }
+
         let dateKey = DailyChallengeSchedule.currentDateKey()
         let challenge = await service.fetchChallenge(for: dateKey)
         currentChallenge = challenge
-        progress = loadProgress(for: challenge.dateKey, attemptLimit: challenge.attemptLimit)
 
+        var loaded = loadProgress(for: challenge.dateKey, attemptLimit: challenge.attemptLimit)
+        // Backfill submittedPlayerID for progress saved before this field existed
+        if loaded.didSubmit && loaded.submittedPlayerID == nil, let playerID = playerProfile?.gamePlayerID {
+            loaded.submittedPlayerID = playerID
+            saveProgress(loaded)
+        }
+        progress = loaded
+
+        let badgesPlayerID = playerProfile?.gamePlayerID ?? lastKnownPlayerID
         async let leaderboardTask = service.fetchLeaderboard(for: challenge.dateKey)
-        async let badgesTask = service.fetchBadges(for: playerProfile?.gamePlayerID)
+        async let badgesTask = service.fetchBadges(for: badgesPlayerID)
 
+        leaderboard = await leaderboardTask
+        badges = await badgesTask
+    }
+
+    func refreshLeaderboardOnly(playerProfile: GameCenterPlayerProfile?) async {
+        if let playerID = playerProfile?.gamePlayerID {
+            defaults.set(playerID, forKey: Keys.lastKnownPlayerID)
+        }
+        guard let currentChallenge else { return }
+        let badgesPlayerID = playerProfile?.gamePlayerID ?? lastKnownPlayerID
+        async let leaderboardTask = service.fetchLeaderboard(for: currentChallenge.dateKey)
+        async let badgesTask = service.fetchBadges(for: badgesPlayerID)
         leaderboard = await leaderboardTask
         badges = await badgesTask
     }
@@ -103,6 +142,8 @@ final class DailyChallengeStore: ObservableObject {
 
         progress.didSubmit = true
         progress.submittedBestReactionMS = progress.bestReactionMS
+        progress.submittedPlayerID = playerProfile?.gamePlayerID
+        progress.submittedPlayerName = playerProfile?.displayName
         self.progress = progress
         saveProgress(progress)
 
@@ -126,6 +167,8 @@ final class DailyChallengeStore: ObservableObject {
                 progress: progress,
                 bestReactionMS: bestReactionMS
             )
+            // Brief delay so CloudKit finishes indexing before we query rankings
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             leaderboard = await service.fetchLeaderboard(for: currentChallenge.dateKey)
             badges = await service.fetchBadges(for: playerProfile.gamePlayerID)
             lastErrorMessage = nil
@@ -240,6 +283,27 @@ final class DailyChallengeStore: ObservableObject {
     func debugClearAwardsAndLeaderboard() {
         leaderboard = []
         badges = []
+    }
+
+    func debugWipeAllCloudKitEntries() async {
+        guard let currentChallenge else { return }
+        try? await service.deleteAllSubmissions(for: currentChallenge.dateKey)
+        leaderboard = []
+        lastErrorMessage = nil
+    }
+
+    func debugWipeMyCloudKitEntry(playerProfile: GameCenterPlayerProfile?) async {
+        guard let currentChallenge else { return }
+        let playerID = playerProfile?.gamePlayerID ?? progress?.submittedPlayerID
+        if let playerID {
+            try? await service.deleteSubmission(for: currentChallenge.dateKey, playerID: playerID)
+        }
+        // Reset local progress too
+        let fresh = DailyChallengeProgress(challengeDateKey: currentChallenge.dateKey, attempts: [], didSubmit: false, submittedBestReactionMS: nil)
+        progress = fresh
+        saveProgress(fresh)
+        leaderboard = await service.fetchLeaderboard(for: currentChallenge.dateKey)
+        lastErrorMessage = nil
     }
 
     func debugForceVariant(_ variant: DailyChallengeVariant) {
@@ -455,6 +519,40 @@ actor DailyChallengeCloudService {
             bestReactionMS: Int(bestReactionMS),
             submittedAt: submittedAt
         )
+    }
+
+    func deleteAllSubmissions(for dateKey: String) async throws {
+        let predicate = NSPredicate(format: "challengeDateKey == %@", dateKey)
+        let query = CKQuery(recordType: Constants.submissionRecordType, predicate: predicate)
+
+        let results = try await database.records(matching: query, inZoneWith: nil, desiredKeys: [], resultsLimit: 200)
+        let recordIDs = results.matchResults.compactMap { _, result in try? result.get().recordID }
+
+        guard !recordIDs.isEmpty else { return }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let operation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
+            operation.modifyRecordsResultBlock = { result in
+                switch result {
+                case .success: continuation.resume()
+                case .failure(let error): continuation.resume(throwing: error)
+                }
+            }
+            database.add(operation)
+        }
+    }
+
+    func deleteSubmission(for dateKey: String, playerID: String) async throws {
+        let recordID = CKRecord.ID(recordName: "\(dateKey)-\(playerID)")
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            database.delete(withRecordID: recordID) { _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     private func save(record: CKRecord) async throws {

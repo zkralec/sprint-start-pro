@@ -99,6 +99,12 @@ struct DailyChallengeView: View {
         .task(id: refreshKey) {
             await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
         }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                await dailyChallengeStore.refreshLeaderboardOnly(playerProfile: gameCenterManager.playerProfile)
+            }
+        }
         .onAppear {
             try? AudioSessionManager.shared.configure(appStore.settings.playOverSilent ? .playOverSilent : .respectsSilent)
             prepareHaptics()
@@ -430,6 +436,20 @@ struct DailyChallengeView: View {
                     }
                     .padding(.horizontal, 4)
 
+                    // ID diagnostic — helps spot GK ID mismatches after kill/reopen
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("GC playerID: \(gameCenterManager.playerProfile?.gamePlayerID ?? "nil")")
+                        Text("submittedPlayerID: \(dailyChallengeStore.submittedPlayerID ?? "nil")")
+                        Text("lastKnownPlayerID: \(dailyChallengeStore.lastKnownPlayerID ?? "nil")")
+                        Text("submittedName: \(dailyChallengeStore.submittedPlayerName ?? "nil")")
+                        let matched = playerLeaderboardEntry != nil
+                        Text("entry matched: \(matched ? "✓" : "✗")")
+                            .foregroundStyle(matched ? .green : .red)
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+
                     HStack(spacing: 10) {
                         Button(gameCenterManager.isAuthenticated ? "Mock Sign Out" : "Mock Sign In") {
                             if gameCenterManager.isAuthenticated {
@@ -455,6 +475,27 @@ struct DailyChallengeView: View {
                             isHolding = false
                         }
                         .buttonStyle(.bordered)
+
+                        Button("Wipe My Entry") {
+                            Task {
+                                await dailyChallengeStore.debugWipeMyCloudKitEntry(playerProfile: gameCenterManager.playerProfile)
+                                resetAttemptUI()
+                                isHolding = false
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
+
+                        Button("Wipe All Entries") {
+                            Task {
+                                await dailyChallengeStore.debugWipeAllCloudKitEntries()
+                                dailyChallengeStore.debugResetTodayProgress()
+                                resetAttemptUI()
+                                isHolding = false
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
 
                         Button("Add 138 ms") {
                             dailyChallengeStore.debugAddAttempt(reactionMS: 138, falseStart: false)
@@ -564,8 +605,25 @@ struct DailyChallengeView: View {
     }
 
     private var playerLeaderboardEntry: DailyChallengeLeaderboardEntry? {
-        guard let playerID = gameCenterManager.playerProfile?.gamePlayerID else { return nil }
-        return dailyChallengeStore.leaderboard.first { $0.playerID == playerID }
+        let board = dailyChallengeStore.leaderboard
+        guard !board.isEmpty, dailyChallengeStore.hasSubmittedToday else { return nil }
+
+        // Tier 1: match by player ID — try live GC profile, then persisted ID, then last-known ID
+        let playerID = gameCenterManager.playerProfile?.gamePlayerID
+            ?? dailyChallengeStore.submittedPlayerID
+            ?? dailyChallengeStore.lastKnownPlayerID
+        if let playerID, let entry = board.first(where: { $0.playerID == playerID }) {
+            return entry
+        }
+
+        // Tier 2: name-based fallback (handles debug-vs-real-GK ID mismatches in test sessions)
+        let playerName = gameCenterManager.playerProfile?.displayName
+            ?? dailyChallengeStore.submittedPlayerName
+        if let playerName, let entry = board.first(where: { $0.playerName == playerName }) {
+            return entry
+        }
+
+        return nil
     }
 
     private func topTodayRow(_ entry: DailyChallengeLeaderboardEntry) -> some View {
@@ -989,7 +1047,7 @@ private struct DailyChallengeLeaderboardPage: View {
     @ViewBuilder
     private func podiumSlot(rank: Int) -> some View {
         let isChampion = rank == 1
-        let slotHeight: CGFloat = isChampion ? 248 : 192
+        let slotHeight: CGFloat = rank == 1 ? 248 : rank == 2 ? 210 : 180
 
         if let entry = podiumEntries.first(where: { $0.rank == rank }) {
             let tint = entry.badge.map(badgeColor(for:)) ?? themeColor

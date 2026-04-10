@@ -487,6 +487,10 @@ struct DailyChallengeProgress: Codable, Equatable {
     var attempts: [DailyChallengeAttempt]
     var didSubmit: Bool
     var submittedBestReactionMS: Int?
+    /// Persisted so we can match the leaderboard entry after a cold launch before Game Center authenticates.
+    var submittedPlayerID: String? = nil
+    /// Player's display name at submission time — secondary identifier if IDs mismatch (e.g. debug vs real GK).
+    var submittedPlayerName: String? = nil
 
     var bestReactionMS: Int? {
         attempts.compactMap(\.reactionMS).min()
