@@ -12,6 +12,7 @@ enum ProFeature: String, Identifiable {
     case reactionTracking
     case sessionHistory
     case advancedRandomness
+    case dailyChallenge
 
     var id: String { rawValue }
 
@@ -25,6 +26,8 @@ enum ProFeature: String, Identifiable {
             return "Session History"
         case .advancedRandomness:
             return "Advanced Randomness"
+        case .dailyChallenge:
+            return "Daily Challenge"
         }
     }
 
@@ -38,6 +41,8 @@ enum ProFeature: String, Identifiable {
             return "Save and review recent reaction sessions."
         case .advancedRandomness:
             return "Use Medium and High randomness settings for more race-like variation."
+        case .dailyChallenge:
+            return "Compete in rotating daily challenge events and submit your score to the global leaderboard."
         }
     }
 }

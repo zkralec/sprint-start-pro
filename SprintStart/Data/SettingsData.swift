@@ -140,6 +140,7 @@ enum ThemeOption: String, Codable, CaseIterable, Identifiable {
 enum AppMode: String, Codable, CaseIterable, Identifiable {
     case standard
     case reaction
+    case dailyChallenge
 
     var id: Self { self }
 
@@ -147,6 +148,7 @@ enum AppMode: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .standard: return "Standard"
         case .reaction: return "Reaction"
+        case .dailyChallenge: return "Daily"
         }
     }
 
@@ -154,6 +156,7 @@ enum AppMode: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .standard: return "speaker.wave.3.fill"
         case .reaction: return "hand.point.up.left.fill"
+        case .dailyChallenge: return "trophy.fill"
         }
     }
 }

@@ -28,6 +28,14 @@ struct MainModesView: View {
                 Label(AppMode.reaction.title, systemImage: AppMode.reaction.systemImage)
             }
             .tag(AppMode.reaction)
+
+            NavigationStack {
+                DailyChallengeView()
+            }
+            .tabItem {
+                Label(AppMode.dailyChallenge.title, systemImage: AppMode.dailyChallenge.systemImage)
+            }
+            .tag(AppMode.dailyChallenge)
         }
         .tint(appStore.settings.theme.accentColor)
         .toolbar(.visible, for: .tabBar)
@@ -45,4 +53,6 @@ struct MainModesView: View {
         .environmentObject(AppSettingsStore())
         .environmentObject(PurchaseManager())
         .environmentObject(ReactionHistoryStore())
+        .environmentObject(GameCenterManager())
+        .environmentObject(DailyChallengeStore())
 }

@@ -99,6 +99,7 @@ struct ProPaywallView: View {
             HStack(spacing: 8) {
                 benefitPill("Reaction")
                 benefitPill("History")
+                benefitPill("Daily")
                 benefitPill("Randomness")
                 benefitPill("Themes")
             }
@@ -112,6 +113,10 @@ struct ProPaywallView: View {
                 benefitRow(
                     title: "Review session history",
                     detail: "See trends and recent attempts instead of training blind."
+                )
+                benefitRow(
+                    title: "Compete in daily challenges",
+                    detail: "Use limited attempts, submit your best score, and chase podium badges."
                 )
                 benefitRow(
                     title: "Unlock more control",

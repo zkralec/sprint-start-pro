@@ -74,7 +74,6 @@ struct ReactionView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: GlassLayout.sectionSpacing) {
-                header
 
                 lockableSummarySection
 
@@ -121,7 +120,7 @@ struct ReactionView: View {
             .padding(GlassLayout.screenPadding)
         }
         .scrollDisabled(isHolding || sequenceActive)
-        .navigationTitle("Sprint Start Pro")
+        .navigationTitle("Reaction Mode")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -164,16 +163,6 @@ struct ReactionView: View {
         .sheet(item: $paywallFeature) { feature in
             ProPaywallView(feature: feature)
         }
-    }
-
-    private var header: some View {
-        AppSectionHeader(
-            systemName: "hand.point.up.left.fill",
-            tint: themeColor,
-            title: "Reaction Mode",
-            summary: "Train reaction time."
-        )
-        .liquidGlassCard()
     }
 
     private var summarySection: some View {

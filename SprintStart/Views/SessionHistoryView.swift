@@ -125,7 +125,6 @@ struct SessionHistoryView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: GlassLayout.sectionSpacing) {
-                header
 
                 lockableHistorySection(rangePicker)
                 lockableHistorySection(statsSection)
@@ -134,7 +133,7 @@ struct SessionHistoryView: View {
             }
             .padding(GlassLayout.screenPadding)
         }
-        .navigationTitle("History")
+        .navigationTitle("Reaction History")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .liquidGlassScreenBackground(theme: appStore.settings.theme)
@@ -149,16 +148,6 @@ struct SessionHistoryView: View {
         .sheet(item: $paywallFeature) { feature in
             ProPaywallView(feature: feature)
         }
-    }
-
-    private var header: some View {
-        AppSectionHeader(
-            systemName: "chart.line.uptrend.xyaxis",
-            tint: appStore.settings.theme.accentColor,
-            title: "Session History",
-            summary: "Review your sessions."
-        )
-        .liquidGlassCard()
     }
 
     private var rangePicker: some View {
@@ -236,14 +225,18 @@ struct SessionHistoryView: View {
                 }
                 .chartXAxis {
                     AxisMarks(values: xAxisValues) { value in
-                        AxisGridLine()
-                        AxisTick()
-                        AxisValueLabel {
+                        AxisGridLine(stroke: StrokeStyle(lineWidth: 1))
+                            .foregroundStyle(.secondary.opacity(0.25))
+                        AxisTick(length: 6, stroke: StrokeStyle(lineWidth: 1))
+                            .foregroundStyle(.secondary.opacity(0.4))
+                        AxisValueLabel(anchor: .top, verticalSpacing: 6) {
                             if let attemptNumber = value.as(Int.self),
                                let point = chartPoint(for: attemptNumber) {
                                 VStack(spacing: 2) {
-                                    Text("A\(attemptNumber)")
+                                    Text("\(attemptNumber)")
+                                        .fontWeight(.semibold)
                                     Text(point.date, format: selectedRange == .day ? .dateTime.hour().minute() : .dateTime.month(.abbreviated).day())
+                                        .foregroundStyle(.secondary)
                                 }
                                 .font(AppTypography.caption)
                                 .multilineTextAlignment(.center)
@@ -251,7 +244,6 @@ struct SessionHistoryView: View {
                         }
                     }
                 }
-                .chartXAxisLabel("Attempt Order")
                 .chartPlotStyle { content in
                     content
                         .background(.ultraThinMaterial.opacity(0.35))

@@ -40,7 +40,6 @@ struct StarterView: View {
         GeometryReader { geometry in
             ScrollView {
                 VStack(spacing: GlassLayout.sectionSpacing) {
-                    header
 
                     TimelineView(.animation(minimumInterval: 0.05, paused: countdownEndDate == nil)) { context in
                         CountdownRing(
@@ -106,16 +105,6 @@ struct StarterView: View {
             canStart = true
             started = false
         }
-    }
-
-    private var header: some View {
-        AppSectionHeader(
-            systemName: "speaker.wave.3.fill",
-            tint: themeColor,
-            title: "Standard Mode",
-            summary: "Practice your start."
-        )
-        .liquidGlassCard()
     }
 
     private var controlsSection: some View {
