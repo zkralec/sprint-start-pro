@@ -14,6 +14,7 @@ struct DailyChallengeView: View {
     @EnvironmentObject private var purchaseManager: PurchaseManager
     @EnvironmentObject private var gameCenterManager: GameCenterManager
     @EnvironmentObject private var dailyChallengeStore: DailyChallengeStore
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var isHolding = false
     @State private var sequenceActive = false
@@ -27,6 +28,7 @@ struct DailyChallengeView: View {
     @State private var paywallFeature: ProFeature?
 #if DEBUG
     @State private var debugControlsExpanded = false
+    @State private var debugBadgePreviewRoute: DebugBadgePreviewRoute?
 #endif
 
     private let synthesizer = AVSpeechSynthesizer()
@@ -102,7 +104,19 @@ struct DailyChallengeView: View {
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
-                await dailyChallengeStore.refreshLeaderboardOnly(playerProfile: gameCenterManager.playerProfile)
+                if dailyChallengeStore.currentChallenge?.dateKey != DailyChallengeSchedule.currentDateKey() {
+                    await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
+                } else {
+                    await dailyChallengeStore.refreshLeaderboardOnly(playerProfile: gameCenterManager.playerProfile)
+                }
+            }
+        }
+        .onChange(of: scenePhase) {
+            guard scenePhase == .active else { return }
+            Task {
+                if dailyChallengeStore.currentChallenge?.dateKey != DailyChallengeSchedule.currentDateKey() {
+                    await dailyChallengeStore.refresh(playerProfile: gameCenterManager.playerProfile)
+                }
             }
         }
         .onAppear {
@@ -121,6 +135,17 @@ struct DailyChallengeView: View {
         .sheet(item: $paywallFeature) { feature in
             ProPaywallView(feature: feature)
         }
+#if DEBUG
+        .navigationDestination(item: $debugBadgePreviewRoute) { route in
+            switch route {
+            case .badgeVault:
+                DailyChallengeBadgesPage()
+                    .environmentObject(appStore)
+                    .environmentObject(gameCenterManager)
+                    .environmentObject(dailyChallengeStore)
+            }
+        }
+#endif
 
     }
 
@@ -411,6 +436,17 @@ struct DailyChallengeView: View {
 
 
 #if DEBUG
+    private enum DebugBadgePreviewRoute: Identifiable {
+        case badgeVault
+
+        var id: String {
+            switch self {
+            case .badgeVault:
+                return "badgeVault"
+            }
+        }
+    }
+
     private var debugSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             DisclosureGroup(isExpanded: $debugControlsExpanded) {
@@ -521,6 +557,13 @@ struct DailyChallengeView: View {
 
                         Button("Sample Badges") {
                             dailyChallengeStore.debugLoadSampleBadges()
+                            debugBadgePreviewRoute = .badgeVault
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Badge Gallery") {
+                            dailyChallengeStore.debugLoadBadgeGallery()
+                            debugBadgePreviewRoute = .badgeVault
                         }
                         .buttonStyle(.bordered)
                     }
@@ -1084,7 +1127,8 @@ private struct DailyChallengeLeaderboardPage: View {
                 .padding(.horizontal, 8)
                 .padding(.bottom, 14)
             }
-            .frame(maxWidth: .infinity, minHeight: slotHeight)
+            .frame(maxWidth: .infinity)
+            .frame(height: slotHeight, alignment: .top)
             .appInsetPanel(tint: tint, cornerRadius: 22)
             .overlay(alignment: .top) {
                 if isCurrentPlayer(entry) {
@@ -1106,7 +1150,8 @@ private struct DailyChallengeLeaderboardPage: View {
                     .font(AppTypography.captionStrong)
                     .foregroundStyle(.tertiary)
             }
-            .frame(maxWidth: .infinity, minHeight: slotHeight)
+            .frame(maxWidth: .infinity)
+            .frame(height: slotHeight)
             .background(
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .strokeBorder(.quaternary, style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
@@ -1239,10 +1284,25 @@ private struct DailyChallengeBadgesPage: View {
 
     private var themeColor: Color { appStore.settings.theme.accentColor }
 
+    private var shouldRequireAuthentication: Bool {
+#if DEBUG
+        dailyChallengeStore.debugBadgePreview.isEmpty && dailyChallengeStore.badges.isEmpty
+#else
+        true
+#endif
+    }
+
     /// Only show badges from completed days — current day positions aren't final yet.
     private var earnedBadges: [DailyChallengeBadgeAward] {
         let todayKey = DailyChallengeSchedule.currentDateKey()
-        return dailyChallengeStore.badges.filter { $0.dateKey != todayKey }
+#if DEBUG
+        let source = dailyChallengeStore.debugBadgePreview.isEmpty
+            ? dailyChallengeStore.badges
+            : dailyChallengeStore.debugBadgePreview
+#else
+        let source = dailyChallengeStore.badges
+#endif
+        return source.filter { $0.dateKey != todayKey }
     }
 
     private var goldAwards: [DailyChallengeBadgeAward] {
@@ -1257,17 +1317,33 @@ private struct DailyChallengeBadgesPage: View {
         earnedBadges.filter { $0.badge == .bronze }
     }
 
+    private var sortedAwards: [DailyChallengeBadgeAward] {
+        earnedBadges.sorted {
+            if $0.dateKey == $1.dateKey {
+                return badgePriority($0.badge) < badgePriority($1.badge)
+            }
+            return $0.dateKey > $1.dateKey
+        }
+    }
+
+    private var featuredAward: DailyChallengeBadgeAward? {
+        sortedAwards.first
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: GlassLayout.sectionSpacing) {
                 vaultHeroCard
 
-                if !gameCenterManager.isAuthenticated {
+                if shouldRequireAuthentication && !gameCenterManager.isAuthenticated {
                     lockedCard
                 } else if earnedBadges.isEmpty {
                     emptyVaultCard
                 } else {
-                    if earnedBadges.count > 1 {
+                    if let featuredAward {
+                        featuredBadgeSection(featuredAward)
+                    }
+                    if sortedAwards.count > 1 {
                         showcaseSection
                     }
                     medalTierSection(title: "Gold", icon: "crown.fill", awards: goldAwards)
@@ -1305,7 +1381,7 @@ private struct DailyChallengeBadgesPage: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Badge Vault")
                     .font(.system(size: 24, weight: .bold, design: .rounded))
-                Text("Top-three collectibles. Badges lock in after midnight EST.")
+                Text("Podium collectibles with challenge-specific crests, finishes, and event details.")
                     .font(AppTypography.secondary)
                     .foregroundStyle(.secondary)
             }
@@ -1367,7 +1443,7 @@ private struct DailyChallengeBadgesPage: View {
             VStack(spacing: 6) {
                 Text("No Badges Yet")
                     .font(AppTypography.cardTitle)
-                Text("Place top 3 in a daily challenge. Badges appear after reset.")
+                Text("Place top 3 in a daily challenge. Each podium finish mints a custom badge after reset.")
                     .font(AppTypography.secondary)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -1380,18 +1456,72 @@ private struct DailyChallengeBadgesPage: View {
 
     // MARK: - Showcase
 
+    private func featuredBadgeSection(_ award: DailyChallengeBadgeAward) -> some View {
+        let theme = badgeTheme(for: award)
+
+        return VStack(alignment: .leading, spacing: 14) {
+            AppSectionHeader(
+                systemName: "sparkles.rectangle.stack.fill",
+                tint: theme.baseTint,
+                title: "Featured Badge",
+                summary: "Latest podium finish"
+            )
+
+            HStack(spacing: 18) {
+                badgeEmblem(theme: theme, size: 130)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(award.challengeTitle)
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+
+                    Text(theme.motifLabel.uppercased())
+                        .font(AppTypography.captionEmphasis)
+                        .foregroundStyle(theme.baseTint)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(theme.baseTint.opacity(0.12), in: Capsule())
+
+                    HStack(spacing: 10) {
+                        detailChip(title: award.badge.title, value: placementLabel(for: award.badge), tint: theme.baseTint)
+                        detailChip(title: "Time", value: "\(award.bestReactionMS) ms", tint: theme.highlight)
+                    }
+
+                    Text(formattedDate(for: award.dateKey))
+                        .font(AppTypography.secondaryStrong)
+                        .foregroundStyle(.secondary)
+
+                    Text("Earned in \(award.challengeTitle), finished \(placementLabel(for: award.badge).lowercased()) with a \(award.bestReactionMS) ms reaction.")
+                        .font(AppTypography.secondary)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .background(featuredBackground(theme: theme))
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(theme.baseTint.opacity(0.18), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .liquidGlassCard()
+    }
+
     private var showcaseSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             AppSectionHeader(
                 systemName: "sparkles",
                 tint: themeColor,
                 title: "Recent Pulls",
-                summary: "Latest podium pulls"
+                summary: "Latest minted badges"
             )
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    ForEach(earnedBadges.prefix(6)) { award in
+                    ForEach(sortedAwards.dropFirst().prefix(6)) { award in
                         showcaseTile(award)
                     }
                 }
@@ -1403,20 +1533,11 @@ private struct DailyChallengeBadgesPage: View {
     }
 
     private func showcaseTile(_ award: DailyChallengeBadgeAward) -> some View {
-        let tint = badgeColor(for: award.badge)
-        let icon = award.badge == .gold ? "crown.fill" : "medal.fill"
+        let theme = badgeTheme(for: award)
 
         return VStack(spacing: 0) {
-            // Medal header
-            ZStack {
-                Circle()
-                    .fill(tint.opacity(0.18))
-                    .frame(width: 44, height: 44)
-                Image(systemName: icon)
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(tint)
-            }
-            .padding(.top, 16)
+            badgeEmblem(theme: theme, size: 76)
+                .padding(.top, 16)
 
             Spacer(minLength: 10)
 
@@ -1428,18 +1549,25 @@ private struct DailyChallengeBadgesPage: View {
 
                 Text("\(award.bestReactionMS) ms")
                     .font(AppTypography.metricCompact)
-                    .foregroundStyle(tint)
+                    .foregroundStyle(theme.baseTint)
 
-                Text(award.dateKey)
+                Text(formattedDate(for: award.dateKey))
                     .font(AppTypography.caption)
                     .foregroundStyle(.tertiary)
+
+                    placementPill(for: award.badge, theme: theme)
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 16)
         }
         .frame(width: 160)
         .frame(minHeight: 210)
-        .appInsetPanel(tint: tint, cornerRadius: 22)
+        .background(badgeCardBackground(theme: theme))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(theme.baseTint.opacity(0.16), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     // MARK: - Medal Tiers
@@ -1447,17 +1575,17 @@ private struct DailyChallengeBadgesPage: View {
     @ViewBuilder
     private func medalTierSection(title: String, icon: String, awards: [DailyChallengeBadgeAward]) -> some View {
         if !awards.isEmpty {
-            let tint = badgeColor(for: awards[0].badge)
+            let sampleTheme = badgeTheme(for: awards[0])
 
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
                     ZStack {
                         Circle()
-                            .fill(tint.opacity(0.18))
+                            .fill(sampleTheme.baseTint.opacity(0.18))
                             .frame(width: 34, height: 34)
                         Image(systemName: icon)
                             .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(tint)
+                            .foregroundStyle(sampleTheme.baseTint)
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -1481,18 +1609,10 @@ private struct DailyChallengeBadgesPage: View {
     }
 
     private func badgeRow(_ award: DailyChallengeBadgeAward) -> some View {
-        let tint = badgeColor(for: award.badge)
-        let icon = award.badge == .gold ? "crown.fill" : "medal.fill"
+        let theme = badgeTheme(for: award)
 
         return HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(tint.opacity(0.15))
-                    .frame(width: 48, height: 48)
-                Image(systemName: icon)
-                    .foregroundStyle(tint)
-                    .font(.body.weight(.semibold))
-            }
+            badgeEmblem(theme: theme, size: 54)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(award.challengeTitle)
@@ -1503,26 +1623,30 @@ private struct DailyChallengeBadgesPage: View {
                     Text("\(award.bestReactionMS) ms")
                         .font(.system(size: 14, weight: .bold, design: .rounded))
                         .monospacedDigit()
-                        .foregroundStyle(tint)
+                        .foregroundStyle(theme.baseTint)
 
-                    Text(award.dateKey)
+                    Text(formattedDate(for: award.dateKey))
                         .font(AppTypography.caption)
                         .foregroundStyle(.tertiary)
                 }
+
+                Text(theme.motifLabel)
+                    .font(AppTypography.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer(minLength: 4)
 
-            Text(award.badge.title)
-                .font(AppTypography.captionEmphasis)
-                .foregroundStyle(tint)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(tint.opacity(0.14), in: Capsule())
+            placementPill(for: award.badge, theme: theme)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .appInsetPanel(tint: tint, cornerRadius: 16)
+        .background(badgeCardBackground(theme: theme))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(theme.baseTint.opacity(0.14), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     // MARK: - Helpers
@@ -1548,11 +1672,308 @@ private struct DailyChallengeBadgesPage: View {
         .appInsetPanel(tint: tint, cornerRadius: 16)
     }
 
-    private func badgeColor(for badge: DailyChallengeBadge) -> Color {
+    private func badgeTheme(for award: DailyChallengeBadgeAward) -> BadgeTheme {
+        let motif = BadgeMotif(title: award.challengeTitle)
+
+        switch award.badge {
+        case .gold:
+            return BadgeTheme(
+                tier: .gold,
+                baseTint: Color(red: 0.91, green: 0.72, blue: 0.18),
+                highlight: Color(red: 1.0, green: 0.94, blue: 0.67),
+                shadow: Color(red: 0.44, green: 0.30, blue: 0.08),
+                motif: motif
+            )
+        case .silver:
+            return BadgeTheme(
+                tier: .silver,
+                baseTint: Color(red: 0.67, green: 0.72, blue: 0.78),
+                highlight: Color(red: 0.90, green: 0.94, blue: 0.98),
+                shadow: Color(red: 0.34, green: 0.39, blue: 0.47),
+                motif: motif
+            )
+        case .bronze:
+            return BadgeTheme(
+                tier: .bronze,
+                baseTint: Color(red: 0.73, green: 0.45, blue: 0.24),
+                highlight: Color(red: 0.93, green: 0.72, blue: 0.50),
+                shadow: Color(red: 0.40, green: 0.22, blue: 0.12),
+                motif: motif
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func badgeEmblem(theme: BadgeTheme, size: CGFloat) -> some View {
+        ZStack {
+            emblemBase(theme: theme, size: size)
+
+            Circle()
+                .fill(theme.highlight.opacity(0.10))
+                .frame(width: size * 0.66, height: size * 0.66)
+
+            Image(systemName: theme.motif.primarySymbol)
+                .font(.system(size: size * 0.30, weight: .black, design: .rounded))
+                .foregroundStyle(theme.highlight)
+
+            Image(systemName: theme.motif.secondarySymbol)
+                .font(.system(size: size * 0.14, weight: .bold, design: .rounded))
+                .foregroundStyle(theme.baseTint)
+                .offset(x: size * 0.24, y: size * 0.24)
+        }
+        .shadow(color: theme.shadow.opacity(0.12), radius: 10, y: 4)
+    }
+
+    @ViewBuilder
+    private func emblemBase(theme: BadgeTheme, size: CGFloat) -> some View {
+        switch theme.tier {
+        case .gold:
+            ZStack {
+                RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [theme.highlight.opacity(0.92), theme.baseTint, theme.shadow.opacity(0.92)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: size, height: size * 1.08)
+                RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                    .stroke(theme.highlight.opacity(0.7), lineWidth: 2)
+                    .frame(width: size * 0.90, height: size * 0.98)
+            }
+        case .silver:
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [theme.highlight.opacity(0.96), theme.baseTint, theme.shadow.opacity(0.86)],
+                            center: .topLeading,
+                            startRadius: 8,
+                            endRadius: size * 0.62
+                        )
+                    )
+                    .frame(width: size, height: size)
+                Circle()
+                    .stroke(theme.highlight.opacity(0.8), lineWidth: 2)
+                    .frame(width: size * 0.84, height: size * 0.84)
+            }
+        case .bronze:
+            ZStack {
+                RoundedRectangle(cornerRadius: size * 0.18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [theme.highlight.opacity(0.90), theme.baseTint, theme.shadow.opacity(0.90)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(width: size * 0.88, height: size * 0.88)
+                    .rotationEffect(.degrees(45))
+                RoundedRectangle(cornerRadius: size * 0.16, style: .continuous)
+                    .stroke(theme.highlight.opacity(0.7), lineWidth: 2)
+                    .frame(width: size * 0.62, height: size * 0.62)
+                    .rotationEffect(.degrees(45))
+            }
+        }
+    }
+
+    private func featuredBackground(theme: BadgeTheme) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            theme.shadow.opacity(0.10),
+                            theme.baseTint.opacity(0.08),
+                            theme.highlight.opacity(0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            Circle()
+                .fill(theme.highlight.opacity(0.06))
+                .frame(width: 220, height: 220)
+                .offset(x: 110, y: -70)
+            Circle()
+                .fill(theme.baseTint.opacity(0.06))
+                .frame(width: 180, height: 180)
+                .offset(x: -110, y: 70)
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(.ultraThinMaterial.opacity(0.55))
+        }
+    }
+
+    private func badgeCardBackground(theme: BadgeTheme) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            theme.baseTint.opacity(0.10),
+                            theme.highlight.opacity(0.06),
+                            theme.shadow.opacity(0.08)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.ultraThinMaterial.opacity(0.72))
+        }
+    }
+
+    private func detailChip(title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(AppTypography.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(AppTypography.captionEmphasis)
+                .foregroundStyle(Color.primary.opacity(0.82))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func placementPill(for badge: DailyChallengeBadge, theme: BadgeTheme) -> some View {
+        Text(placementLabel(for: badge))
+            .font(AppTypography.captionEmphasis)
+            .foregroundStyle(legibleBadgeTextColor(for: theme))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(placementPillBackground(for: theme), in: Capsule())
+    }
+
+    private func legibleBadgeTextColor(for theme: BadgeTheme) -> Color {
+        switch theme.tier {
+        case .gold:
+            return theme.baseTint
+        case .silver:
+            return theme.baseTint
+        case .bronze:
+            return theme.highlight
+        }
+    }
+
+    private func placementPillBackground(for theme: BadgeTheme) -> Color {
+        switch theme.tier {
+        case .gold, .bronze:
+            return theme.baseTint.opacity(0.14)
+        case .silver:
+            return theme.baseTint.opacity(0.20)
+        }
+    }
+
+    private func placementLabel(for badge: DailyChallengeBadge) -> String {
         switch badge {
-        case .gold: return .yellow
-        case .silver: return .gray
-        case .bronze: return .orange
+        case .gold: return "1st Overall"
+        case .silver: return "2nd Overall"
+        case .bronze: return "3rd Overall"
+        }
+    }
+
+    private func badgePriority(_ badge: DailyChallengeBadge) -> Int {
+        switch badge {
+        case .gold: return 0
+        case .silver: return 1
+        case .bronze: return 2
+        }
+    }
+
+    private func formattedDate(for dateKey: String) -> String {
+        Self.displayDateFormatter.string(from: Self.storageDateFormatter.date(from: dateKey) ?? .now)
+    }
+
+    private static let storageDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = DailyChallengeSchedule.fixedEST
+        return formatter
+    }()
+
+    private static let displayDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, yyyy"
+        formatter.timeZone = DailyChallengeSchedule.fixedEST
+        return formatter
+    }()
+}
+
+private struct BadgeTheme {
+    let tier: BadgeTier
+    let baseTint: Color
+    let highlight: Color
+    let shadow: Color
+    let motif: BadgeMotif
+
+    var motifLabel: String { motif.label }
+}
+
+private enum BadgeTier {
+    case gold
+    case silver
+    case bronze
+}
+
+private struct BadgeMotif {
+    let primarySymbol: String
+    let secondarySymbol: String
+    let label: String
+
+    init(title: String) {
+        let normalized = title.lowercased()
+
+        if normalized.contains("burn") || normalized.contains("marathon") {
+            primarySymbol = "flame.fill"
+            secondarySymbol = "timer"
+            label = "Endurance Crest"
+        } else if normalized.contains("silent") || normalized.contains("dead silence") {
+            primarySymbol = "sparkles"
+            secondarySymbol = "eye.fill"
+            label = "Silent Flash Crest"
+        } else if normalized.contains("thunder") || normalized.contains("phantom") {
+            primarySymbol = "bolt.fill"
+            secondarySymbol = "waveform.path.ecg"
+            label = "Shock Pulse Crest"
+        } else if normalized.contains("whistle") {
+            primarySymbol = "wind"
+            secondarySymbol = "speaker.wave.2.fill"
+            label = "Whistle Surge Crest"
+        } else if normalized.contains("clap") {
+            primarySymbol = "hands.clap.fill"
+            secondarySymbol = "burst.fill"
+            label = "Impact Crest"
+        } else if normalized.contains("electronic") || normalized.contains("echo") {
+            primarySymbol = "dot.radiowaves.left.and.right"
+            secondarySymbol = "cpu.fill"
+            label = "Signal Crest"
+        } else if normalized.contains("precision") || normalized.contains("tight") {
+            primarySymbol = "scope"
+            secondarySymbol = "target"
+            label = "Precision Crest"
+        } else if normalized.contains("flash") {
+            primarySymbol = "sun.max.fill"
+            secondarySymbol = "bolt.circle.fill"
+            label = "Flash Trap Crest"
+        } else if normalized.contains("off beat") || normalized.contains("rhythm") {
+            primarySymbol = "metronome.fill"
+            secondarySymbol = "waveform"
+            label = "Rhythm Break Crest"
+        } else if normalized.contains("chaos") {
+            primarySymbol = "hurricane"
+            secondarySymbol = "exclamationmark.circle.fill"
+            label = "Chaos Crest"
+        } else if normalized.contains("sudden death") {
+            primarySymbol = "flag.checkered.2.crossed"
+            secondarySymbol = "bolt.heart.fill"
+            label = "Final Heat Crest"
+        } else {
+            primarySymbol = "figure.run"
+            secondarySymbol = "medal.fill"
+            label = "Sprint Crest"
         }
     }
 }

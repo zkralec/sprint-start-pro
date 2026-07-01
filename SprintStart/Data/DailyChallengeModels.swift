@@ -510,7 +510,7 @@ struct DailyChallengeLeaderboardEntry: Identifiable, Equatable {
     }
 }
 
-enum DailyChallengeBadge: String, Identifiable, CaseIterable {
+enum DailyChallengeBadge: String, Codable, Identifiable, CaseIterable {
     case gold
     case silver
     case bronze
@@ -535,7 +535,7 @@ enum DailyChallengeBadge: String, Identifiable, CaseIterable {
     }
 }
 
-struct DailyChallengeBadgeAward: Identifiable, Equatable {
+struct DailyChallengeBadgeAward: Codable, Identifiable, Equatable {
     let id: String
     let dateKey: String
     let challengeTitle: String

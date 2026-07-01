@@ -8,6 +8,11 @@
 import CloudKit
 import Foundation
 
+struct DailyChallengeBadgeLookup {
+    let dateKey: String
+    let playerIDs: [String]
+}
+
 @MainActor
 final class DailyChallengeStore: ObservableObject {
     @Published private(set) var currentChallenge: DailyChallenge?
@@ -17,6 +22,9 @@ final class DailyChallengeStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isSubmitting = false
     @Published var lastErrorMessage: String?
+#if DEBUG
+    @Published private(set) var debugBadgePreview: [DailyChallengeBadgeAward] = []
+#endif
 
     private let defaults: UserDefaults
     private let service: DailyChallengeCloudService
@@ -24,6 +32,12 @@ final class DailyChallengeStore: ObservableObject {
     private enum Keys {
         static let progressPrefix = "dailyChallengeProgress"
         static let lastKnownPlayerID = "dailyChallenge.lastKnownPlayerID"
+        static let knownPlayerIDs = "dailyChallenge.knownPlayerIDs"
+        static let badgeAwardCache = "dailyChallenge.badgeAwardCache"
+    }
+
+    private enum Limits {
+        static let badgeLookupCount = 30
     }
 
     /// The most recently seen Game Center player ID, persisted across cold launches so we can
@@ -38,6 +52,7 @@ final class DailyChallengeStore: ObservableObject {
     ) {
         self.defaults = defaults
         self.service = service
+        self.badges = Self.loadCachedBadges(from: defaults)
     }
 
     var attemptsUsed: Int {
@@ -73,9 +88,7 @@ final class DailyChallengeStore: ObservableObject {
 
         // Persist the player ID as soon as we have it — survives cold launches and backfills
         // entries submitted before submittedPlayerID was added to DailyChallengeProgress.
-        if let playerID = playerProfile?.gamePlayerID {
-            defaults.set(playerID, forKey: Keys.lastKnownPlayerID)
-        }
+        rememberPlayerID(playerProfile?.gamePlayerID)
 
         let dateKey = DailyChallengeSchedule.currentDateKey()
         let challenge = await service.fetchChallenge(for: dateKey)
@@ -89,24 +102,19 @@ final class DailyChallengeStore: ObservableObject {
         }
         progress = loaded
 
-        let badgesPlayerID = playerProfile?.gamePlayerID ?? lastKnownPlayerID
-        async let leaderboardTask = service.fetchLeaderboard(for: challenge.dateKey)
-        async let badgesTask = service.fetchBadges(for: badgesPlayerID)
-
-        leaderboard = await leaderboardTask
-        badges = await badgesTask
+        await refreshCompetitionData(
+            for: challenge.dateKey,
+            badgeLookups: submittedBadgeLookups(playerProfile: playerProfile)
+        )
     }
 
     func refreshLeaderboardOnly(playerProfile: GameCenterPlayerProfile?) async {
-        if let playerID = playerProfile?.gamePlayerID {
-            defaults.set(playerID, forKey: Keys.lastKnownPlayerID)
-        }
+        rememberPlayerID(playerProfile?.gamePlayerID)
         guard let currentChallenge else { return }
-        let badgesPlayerID = playerProfile?.gamePlayerID ?? lastKnownPlayerID
-        async let leaderboardTask = service.fetchLeaderboard(for: currentChallenge.dateKey)
-        async let badgesTask = service.fetchBadges(for: badgesPlayerID)
-        leaderboard = await leaderboardTask
-        badges = await badgesTask
+        await refreshCompetitionData(
+            for: currentChallenge.dateKey,
+            badgeLookups: submittedBadgeLookups(playerProfile: playerProfile)
+        )
     }
 
     func recordAttempt(
@@ -169,11 +177,51 @@ final class DailyChallengeStore: ObservableObject {
             )
             // Brief delay so CloudKit finishes indexing before we query rankings
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            leaderboard = await service.fetchLeaderboard(for: currentChallenge.dateKey)
-            badges = await service.fetchBadges(for: playerProfile.gamePlayerID)
+            rememberPlayerID(playerProfile.gamePlayerID)
+            leaderboard = try await service.fetchLeaderboard(for: currentChallenge.dateKey)
+            let fetchedBadges = try await service.fetchBadges(
+                lookups: submittedBadgeLookups(playerProfile: playerProfile)
+            )
+            updateBadges(with: fetchedBadges)
             lastErrorMessage = nil
         } catch {
-            lastErrorMessage = "Could not submit today's score. Please try again."
+            lastErrorMessage = cloudStatusMessage(for: error, defaultMessage: "Could not submit today's score. Please try again.")
+        }
+    }
+
+    private func refreshCompetitionData(
+        for dateKey: String,
+        badgeLookups: [DailyChallengeBadgeLookup]
+    ) async {
+        do {
+            leaderboard = try await service.fetchLeaderboard(for: dateKey)
+            lastErrorMessage = nil
+        } catch {
+            lastErrorMessage = cloudStatusMessage(for: error)
+        }
+
+        do {
+            let fetchedBadges = try await service.fetchBadges(lookups: badgeLookups)
+            updateBadges(with: fetchedBadges)
+        } catch {
+            lastErrorMessage = cloudStatusMessage(for: error)
+        }
+    }
+
+    private func cloudStatusMessage(for error: Error, defaultMessage: String = "Leaderboard unavailable right now. Please try again.") -> String {
+        guard let ckError = error as? CKError else {
+            return defaultMessage
+        }
+
+        switch ckError.code {
+        case .badContainer, .missingEntitlement, .notAuthenticated:
+            return "CloudKit is not available for this build or account."
+        case .invalidArguments, .serverRejectedRequest:
+            return "Leaderboard query failed in CloudKit. If this only happens in TestFlight, deploy the production CloudKit schema and indexes."
+        case .permissionFailure:
+            return "CloudKit permission failure. Check the production container configuration."
+        default:
+            return ckError.localizedDescription.isEmpty ? defaultMessage : ckError.localizedDescription
         }
     }
 
@@ -201,6 +249,113 @@ final class DailyChallengeStore: ObservableObject {
 
     private func progressKey(for dateKey: String) -> String {
         "\(Keys.progressPrefix).\(dateKey)"
+    }
+
+    /// Returns submitted progress entries so badges can be fetched with the player ID that
+    /// originally created each CloudKit record.
+    private func submittedProgressEntries() -> [DailyChallengeProgress] {
+        let prefix = Keys.progressPrefix + "."
+        return defaults.dictionaryRepresentation()
+            .keys
+            .filter { $0.hasPrefix(prefix) }
+            .compactMap { key -> DailyChallengeProgress? in
+                guard let data = defaults.data(forKey: key) else { return nil }
+                return try? JSONDecoder().decode(DailyChallengeProgress.self, from: data)
+            }
+            .filter { $0.didSubmit }
+            .sorted { $0.challengeDateKey > $1.challengeDateKey }
+    }
+
+    private func submittedBadgeLookups(playerProfile: GameCenterPlayerProfile?) -> [DailyChallengeBadgeLookup] {
+        let fallbackIDs = uniquePlayerIDs([playerProfile?.gamePlayerID] + knownPlayerIDs.map(Optional.some))
+
+        return submittedProgressEntries()
+            .prefix(Limits.badgeLookupCount)
+            .compactMap { progress in
+                let playerIDs = uniquePlayerIDs([progress.submittedPlayerID] + fallbackIDs.map(Optional.some))
+                guard !playerIDs.isEmpty else { return nil }
+                return DailyChallengeBadgeLookup(dateKey: progress.challengeDateKey, playerIDs: playerIDs)
+            }
+    }
+
+    private var knownPlayerIDs: [String] {
+        if let storedIDs = defaults.stringArray(forKey: Keys.knownPlayerIDs), !storedIDs.isEmpty {
+            return storedIDs
+        }
+        return lastKnownPlayerID.map { [$0] } ?? []
+    }
+
+    private func rememberPlayerID(_ playerID: String?) {
+        guard let playerID, !playerID.isEmpty else { return }
+
+        let existingIDs = knownPlayerIDs
+        defaults.set(playerID, forKey: Keys.lastKnownPlayerID)
+
+        let updatedIDs = uniquePlayerIDs([playerID] + existingIDs.map(Optional.some))
+        defaults.set(updatedIDs, forKey: Keys.knownPlayerIDs)
+    }
+
+    private func updateBadges(with fetchedAwards: [DailyChallengeBadgeAward]) {
+        guard !fetchedAwards.isEmpty else { return }
+
+        badges = mergedBadgeAwards(existing: badges, fetched: fetchedAwards)
+        saveCachedBadges(badges)
+    }
+
+    private func mergedBadgeAwards(
+        existing: [DailyChallengeBadgeAward],
+        fetched: [DailyChallengeBadgeAward]
+    ) -> [DailyChallengeBadgeAward] {
+        var awardsByID: [String: DailyChallengeBadgeAward] = [:]
+        for award in existing {
+            awardsByID[award.id] = award
+        }
+        for award in fetched {
+            awardsByID[award.id] = award
+        }
+
+        return awardsByID.values.sorted {
+            if $0.dateKey == $1.dateKey {
+                return badgePriority($0.badge) < badgePriority($1.badge)
+            }
+            return $0.dateKey > $1.dateKey
+        }
+    }
+
+    private func badgePriority(_ badge: DailyChallengeBadge) -> Int {
+        switch badge {
+        case .gold: return 0
+        case .silver: return 1
+        case .bronze: return 2
+        }
+    }
+
+    private func uniquePlayerIDs(_ playerIDs: [String?]) -> [String] {
+        var seen = Set<String>()
+        var uniqueIDs: [String] = []
+
+        for playerID in playerIDs {
+            guard let playerID, !playerID.isEmpty, !seen.contains(playerID) else { continue }
+            seen.insert(playerID)
+            uniqueIDs.append(playerID)
+        }
+
+        return uniqueIDs
+    }
+
+    private static func loadCachedBadges(from defaults: UserDefaults) -> [DailyChallengeBadgeAward] {
+        guard let data = defaults.data(forKey: Keys.badgeAwardCache),
+              let decoded = try? JSONDecoder().decode([DailyChallengeBadgeAward].self, from: data) else {
+            return []
+        }
+
+        return decoded
+    }
+
+    private func saveCachedBadges(_ badges: [DailyChallengeBadgeAward]) {
+        if let data = try? JSONEncoder().encode(badges) {
+            defaults.set(data, forKey: Keys.badgeAwardCache)
+        }
     }
 
 #if DEBUG
@@ -255,7 +410,7 @@ final class DailyChallengeStore: ObservableObject {
 
     func debugLoadSampleBadges() {
         let challenge = currentChallenge ?? .fallback(for: DailyChallengeSchedule.currentDateKey())
-        badges = [
+        debugBadgePreview = [
             DailyChallengeBadgeAward(
                 id: "\(challenge.dateKey)-gold",
                 dateKey: challenge.dateKey,
@@ -280,9 +435,37 @@ final class DailyChallengeStore: ObservableObject {
         ]
     }
 
+    func debugLoadBadgeGallery() {
+        let variants = Array(DailyChallengeVariant.allCases.prefix(12))
+        debugBadgePreview = variants.enumerated().map { index, variant in
+            let badge: DailyChallengeBadge
+            switch index % 3 {
+            case 0: badge = .gold
+            case 1: badge = .silver
+            default: badge = .bronze
+            }
+
+            let dayOffset = index + 1
+            let date = Calendar.current.date(byAdding: .day, value: -dayOffset, to: .now) ?? .now
+            let dateKey = DailyChallengeSchedule.currentDateKey(now: date)
+
+            return DailyChallengeBadgeAward(
+                id: "\(dateKey)-\(badge.rawValue)-\(variant.rawValue)",
+                dateKey: dateKey,
+                challengeTitle: variant.title,
+                badge: badge,
+                bestReactionMS: 110 + (index * 5)
+            )
+        }
+    }
+
     func debugClearAwardsAndLeaderboard() {
         leaderboard = []
         badges = []
+        saveCachedBadges([])
+#if DEBUG
+        debugBadgePreview = []
+#endif
     }
 
     func debugWipeAllCloudKitEntries() async {
@@ -302,7 +485,7 @@ final class DailyChallengeStore: ObservableObject {
         let fresh = DailyChallengeProgress(challengeDateKey: currentChallenge.dateKey, attempts: [], didSubmit: false, submittedBestReactionMS: nil)
         progress = fresh
         saveProgress(fresh)
-        leaderboard = await service.fetchLeaderboard(for: currentChallenge.dateKey)
+        leaderboard = (try? await service.fetchLeaderboard(for: currentChallenge.dateKey)) ?? []
         lastErrorMessage = nil
     }
 
@@ -354,7 +537,7 @@ actor DailyChallengeCloudService {
         return .fallback(for: dateKey)
     }
 
-    func fetchLeaderboard(for dateKey: String, limit: Int = 50) async -> [DailyChallengeLeaderboardEntry] {
+    func fetchLeaderboard(for dateKey: String, limit: Int = 50) async throws -> [DailyChallengeLeaderboardEntry] {
         let predicate = NSPredicate(format: "challengeDateKey == %@", dateKey)
         let query = CKQuery(recordType: Constants.submissionRecordType, predicate: predicate)
         query.sortDescriptors = [
@@ -362,73 +545,75 @@ actor DailyChallengeCloudService {
             NSSortDescriptor(key: "submittedAt", ascending: true)
         ]
 
-        do {
-            let results = try await database.records(
-                matching: query,
-                inZoneWith: nil,
-                desiredKeys: nil,
-                resultsLimit: limit
-            )
+        let results = try await database.records(
+            matching: query,
+            inZoneWith: nil,
+            desiredKeys: nil,
+            resultsLimit: limit
+        )
 
-            let records = results.matchResults.compactMap { _, result in
-                try? result.get()
-            }
+        let records = results.matchResults.compactMap { _, result in
+            try? result.get()
+        }
 
-            return records.enumerated().compactMap { index, record in
-                leaderboardEntry(from: record, rank: index + 1)
-            }
-        } catch {
-            return []
+        return records.enumerated().compactMap { index, record in
+            leaderboardEntry(from: record, rank: index + 1)
         }
     }
 
-    func fetchBadges(for playerID: String?) async -> [DailyChallengeBadgeAward] {
-        guard let playerID else { return [] }
+    /// Fetches badge awards by looking up each submitted date's record directly by its known
+    /// record name, avoiding a QUERYABLE index requirement on the `playerID` field.
+    func fetchBadges(lookups: [DailyChallengeBadgeLookup]) async throws -> [DailyChallengeBadgeAward] {
+        guard !lookups.isEmpty else { return [] }
 
-        let predicate = NSPredicate(format: "playerID == %@", playerID)
-        let query = CKQuery(recordType: Constants.submissionRecordType, predicate: predicate)
-        query.sortDescriptors = [
-            NSSortDescriptor(key: "submittedAt", ascending: false)
-        ]
-
-        do {
-            let results = try await database.records(
-                matching: query,
-                inZoneWith: nil,
-                desiredKeys: nil,
-                resultsLimit: 12
-            )
-
-            let records = results.matchResults.compactMap { _, result in
-                try? result.get()
-            }
-
-            var awards: [DailyChallengeBadgeAward] = []
-            for record in records {
-                guard let dateKey = record["challengeDateKey"] as? String,
-                      let title = record["challengeTitle"] as? String,
-                      let bestReaction = record["bestReactionMS"] as? Int64 else {
+        var awards: [DailyChallengeBadgeAward] = []
+        var firstError: Error?
+        for lookup in lookups {
+            do {
+                guard let submission = try await fetchSubmissionRecord(for: lookup),
+                      let title = submission.record["challengeTitle"] as? String,
+                      let bestReaction = submission.record["bestReactionMS"] as? Int64 else {
                     continue
                 }
 
-                let topEntries = await fetchLeaderboard(for: dateKey, limit: 3)
-                if let award = topEntries.first(where: { $0.playerID == playerID })?.badge {
+                let topEntries = try await fetchLeaderboard(for: lookup.dateKey, limit: 3)
+                if let entry = topEntries.first(where: { $0.playerID == submission.playerID }),
+                   let badge = entry.badge {
                     awards.append(
                         DailyChallengeBadgeAward(
-                            id: "\(dateKey)-\(award.rawValue)",
-                            dateKey: dateKey,
+                            id: "\(lookup.dateKey)-\(badge.rawValue)",
+                            dateKey: lookup.dateKey,
                             challengeTitle: title,
-                            badge: award,
+                            badge: badge,
                             bestReactionMS: Int(bestReaction)
                         )
                     )
                 }
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+                continue
             }
-
-            return awards
-        } catch {
-            return []
         }
+
+        if awards.isEmpty, let firstError {
+            throw firstError
+        }
+
+        return awards
+    }
+
+    private func fetchSubmissionRecord(for lookup: DailyChallengeBadgeLookup) async throws -> (playerID: String, record: CKRecord)? {
+        for playerID in lookup.playerIDs {
+            let recordID = CKRecord.ID(recordName: "\(lookup.dateKey)-\(playerID)")
+            let recordResults = try await database.records(for: [recordID])
+            if case .success(let record) = recordResults[recordID] {
+                return (playerID, record)
+            }
+        }
+
+        return nil
     }
 
     func submit(
